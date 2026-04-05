@@ -2,6 +2,8 @@
 
 Video Operations Suite is a desktop batch video tool for trimming, remuxing, transcoding, queue management, thumbnail control, and quick preview in one UI.
 
+![Video Operations Suite screenshot](assets/Screenshot_VideoOperationsSuite.jpg)
+
 ## Features
 - Trim first seconds, trim last seconds, roll first seconds to the end, remux, or transcode to MP4 (H.264)
 - Built-in video preview with large transport controls and direct time jump
@@ -15,26 +17,26 @@ Video Operations Suite is a desktop batch video tool for trimming, remuxing, tra
 
 ## Requirements
 - Windows
-- Python 3.14 recommended
+- Python 3.10 recommended
 - FFmpeg and FFprobe available in `PATH`
 - VLC runtime available for embedded playback
 - Python packages from `requirements.txt`
 
 ## Install
 ```bash
-python -m pip install -r requirements.txt
+C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
 ## Run From Source
 ```bash
-python Video_Operations_Suite_v1.py
+C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe Video_Operations_Suite_v1.py
 ```
 
 ## Build
 
 Portable executable:
 ```bash
-python -m PyInstaller --noconfirm --clean Video_Operations_Suite.spec
+C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe -m PyInstaller --noconfirm --clean Video_Operations_Suite.spec
 ```
 
 Installer:
@@ -54,6 +56,7 @@ Build files:
 
 ## Notes
 - The app uses `assets/Video_Operations_Suite_.ico` as the application icon.
+- Development/runtime interpreter used here: `C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe` (`Python 3.10.11`).
 - `VOS_PYTHONPATH` can be set to prepend extra Python paths without hardcoding them in the script.
 - Build output is intentionally excluded from git.
 
