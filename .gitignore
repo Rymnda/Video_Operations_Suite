@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+.codex/
+.idea/
+.vscode/
+
+build/
+dist/
+installer/
+
+.DS_Store
+Thumbs.db
