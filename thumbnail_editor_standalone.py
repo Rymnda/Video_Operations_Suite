@@ -1025,7 +1025,8 @@ class ThumbnailEditorWindow(QtWidgets.QWidget):
         final_output = output_dir / src.name
         same_target = final_output.resolve() == src.resolve()
         try:
-            with tempfile.TemporaryDirectory(prefix="thumb_edit_") as td:
+            temp_root = final_output.parent
+            with tempfile.TemporaryDirectory(prefix="thumb_edit_", dir=str(temp_root)) as td:
                 cover_path = Path(td) / "cover.jpg"
                 temp_output = Path(td) / f"{src.stem}.out{src.suffix}"
                 ok = image.save(str(cover_path), "JPG", 95)

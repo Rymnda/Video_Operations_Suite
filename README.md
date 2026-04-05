@@ -57,6 +57,8 @@ Build files:
 ## Notes
 - The app uses `assets/Video_Operations_Suite_.ico` as the application icon.
 - Recommended setup: use a local virtual environment with Python 3.10.
+- Release builds are tested with Python 3.10 and NumPy 2.x.
+- NumPy 1.x remains a valid fallback if an older OpenCV stack is more stable on a specific machine.
 - `VOS_PYTHONPATH` can be set to prepend extra Python paths without hardcoding them in the script.
 - Build output is intentionally excluded from git.
 

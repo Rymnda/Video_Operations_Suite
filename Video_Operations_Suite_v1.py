@@ -8,6 +8,9 @@ import re
 import subprocess
 import shutil
 import hashlib
+import sqlite3
+import threading
+from collections import deque
 from pathlib import Path
 from typing import Optional, Dict, List, Any
 
@@ -308,6 +311,25 @@ def load_language_map(lang_dir: Path) -> Dict[str, Dict[str, str]]:
     return langs
 
 
+def fast_scan_videos(base: Path):
+    stack = [Path(base)]
+    exts = VIDEO_EXTS
+    while stack:
+        current = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                for entry in it:
+                    try:
+                        if entry.is_dir(follow_symlinks=False):
+                            stack.append(Path(entry.path))
+                        elif entry.is_file(follow_symlinks=False) and Path(entry.name).suffix.lower() in exts:
+                            yield Path(entry.path)
+                    except (PermissionError, FileNotFoundError, OSError):
+                        continue
+        except (PermissionError, FileNotFoundError, OSError):
+            continue
+
+
 def detect_intro_ffmpeg(ffmpeg_path: str, file_path: str) -> float:
     """Zoekt naar blackframe-einde tussen 10s en 240s (intro-detectie)."""
     cmd = [
@@ -382,7 +404,148 @@ APPDATA_DIR.mkdir(parents=True, exist_ok=True)
 QUEUE_JSON = APPDATA_DIR / "queue.json"
 CUSTOM_THUMB_DIR = APPDATA_DIR / "custom_thumbs"
 CUSTOM_THUMB_DIR.mkdir(parents=True, exist_ok=True)
+THUMB_CACHE_DIR = APPDATA_DIR / "thumb_cache"
+THUMB_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+CACHE_DB = APPDATA_DIR / "cache.db"
 SESSION_EXT = ".vos"
+
+
+def file_signature(path: Path | str) -> tuple[str, int, int]:
+    p = Path(path)
+    try:
+        st = p.stat()
+        return (str(p), int(st.st_mtime_ns), int(st.st_size))
+    except Exception:
+        return (str(p), 0, 0)
+
+
+def cached_thumb_file(path: Path | str, mtime_ns: int, size_b: int) -> Path:
+    raw = f"{Path(path)}|{mtime_ns}|{size_b}"
+    digest = hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+    return THUMB_CACHE_DIR / f"{digest}.png"
+
+
+class MediaCacheDB:
+    def __init__(self, db_path: Path):
+        self.db_path = Path(db_path)
+        self._lock = threading.Lock()
+        self._pending: Dict[str, dict] = {}
+        self._batch_size = 128
+        self._init_db()
+
+    def _connect(self):
+        conn = sqlite3.connect(str(self.db_path), timeout=10)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        return conn
+
+    def _init_db(self):
+        with self._connect() as conn:
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS media_cache (
+                    path TEXT PRIMARY KEY,
+                    mtime_ns INTEGER NOT NULL,
+                    size_b INTEGER NOT NULL,
+                    duration_s REAL DEFAULT 0,
+                    thumb_path TEXT DEFAULT '',
+                    updated_at INTEGER NOT NULL
+                )
+                """
+            )
+
+    def get(self, path: str, mtime_ns: int, size_b: int) -> Optional[dict]:
+        with self._lock:
+            pending = self._pending.get(path)
+            if pending and int(pending["mtime_ns"]) == int(mtime_ns) and int(pending["size_b"]) == int(size_b):
+                thumb_path = str(pending.get("thumb_path", "") or "")
+                if thumb_path and not Path(thumb_path).exists():
+                    thumb_path = ""
+                return {
+                    "duration_s": float(pending.get("duration_s", 0.0) or 0.0),
+                    "size_b": int(pending.get("size_b", 0) or 0),
+                    "thumb_path": thumb_path,
+                }
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT duration_s, size_b, thumb_path
+                FROM media_cache
+                WHERE path = ? AND mtime_ns = ? AND size_b = ?
+                """,
+                (path, mtime_ns, size_b),
+            ).fetchone()
+        if not row:
+            return None
+        thumb_path = str(row[2] or "")
+        if thumb_path and not Path(thumb_path).exists():
+            thumb_path = ""
+        return {
+            "duration_s": float(row[0] or 0.0),
+            "size_b": int(row[1] or 0),
+            "thumb_path": thumb_path,
+        }
+
+    def upsert_metadata(self, path: str, mtime_ns: int, size_b: int, duration_s: float):
+        self._queue_upsert(path, mtime_ns, size_b, duration_s=float(duration_s))
+
+    def upsert_thumb(self, path: str, mtime_ns: int, size_b: int, thumb_path: str):
+        self._queue_upsert(path, mtime_ns, size_b, thumb_path=str(thumb_path))
+
+    def _queue_upsert(self, path: str, mtime_ns: int, size_b: int, duration_s: Optional[float] = None, thumb_path: Optional[str] = None):
+        should_flush = False
+        with self._lock:
+            existing = self._pending.get(path, {})
+            record = {
+                "path": path,
+                "mtime_ns": int(mtime_ns),
+                "size_b": int(size_b),
+                "duration_s": float(existing.get("duration_s", 0.0)),
+                "thumb_path": str(existing.get("thumb_path", "")),
+                "updated_at": int(time.time()),
+            }
+            if duration_s is not None:
+                record["duration_s"] = float(duration_s)
+            if thumb_path is not None:
+                record["thumb_path"] = str(thumb_path)
+            self._pending[path] = record
+            should_flush = len(self._pending) >= self._batch_size
+        if should_flush:
+            self.flush_pending()
+
+    def flush_pending(self):
+        with self._lock:
+            if not self._pending:
+                return
+            rows = list(self._pending.values())
+            self._pending.clear()
+        with self._connect() as conn:
+            conn.executemany(
+                """
+                INSERT INTO media_cache(path, mtime_ns, size_b, duration_s, thumb_path, updated_at)
+                VALUES(?, ?, ?, ?, ?, ?)
+                ON CONFLICT(path) DO UPDATE SET
+                    mtime_ns=excluded.mtime_ns,
+                    size_b=excluded.size_b,
+                    duration_s=excluded.duration_s,
+                    thumb_path=excluded.thumb_path,
+                    updated_at=excluded.updated_at
+                """,
+                [
+                    (
+                        row["path"],
+                        row["mtime_ns"],
+                        row["size_b"],
+                        row["duration_s"],
+                        row["thumb_path"],
+                        row["updated_at"],
+                    )
+                    for row in rows
+                ],
+            )
+
+
+MEDIA_CACHE = MediaCacheDB(CACHE_DB)
 
 
 def save_queue(table: QtWidgets.QTableWidget, ui_state: dict):
@@ -985,6 +1148,9 @@ class BatchWorker(QtCore.QThread):
         self.delete_source = delete_source
         self.overwrite_source = overwrite_source
         self._row_live_paused: set[int] = set()
+        self._progress_emit_interval = 0.25
+        self._eta_emit_interval = 0.35
+        self._last_overall_eta_emit = 0.0
 
     def request_stop_all(self):
         self.stop_flag = True
@@ -1028,7 +1194,10 @@ class BatchWorker(QtCore.QThread):
             except Exception:
                 pass
 
-    def _emit_overall_eta(self):
+    def _emit_overall_eta(self, force: bool = False):
+        now = time.monotonic()
+        if not force and (now - self._last_overall_eta_emit) < self._eta_emit_interval:
+            return
         remaining = 0.0
         remaining += sum(max(0.0, v) for v in self._per_row_left.values())
         for job in self.jobs:
@@ -1043,6 +1212,7 @@ class BatchWorker(QtCore.QThread):
                 remaining += max(5.0, indur)
             else:
                 remaining += max(5.0, indur)
+        self._last_overall_eta_emit = now
         self.overall_eta.emit(f"Totale ETA: ~{fmt_hms(remaining)}")
 
     @staticmethod
@@ -1093,7 +1263,7 @@ class BatchWorker(QtCore.QThread):
                     self.row_done.emit(r, False, str(outp))
                 job["_done"] = True
                 self._per_row_left.pop(r, None)
-                self._emit_overall_eta()
+                self._emit_overall_eta(force=True)
                 continue
 
             ok = self._do_job(
@@ -1157,7 +1327,7 @@ class BatchWorker(QtCore.QThread):
 
             job["_done"] = True
             self._per_row_left.pop(r, None)
-            self._emit_overall_eta()
+            self._emit_overall_eta(force=True)
             self.row_done.emit(r, ok, str(final_out) if ok else "Mislukt")
             self.sound_notify.emit(False)
 
@@ -1398,6 +1568,7 @@ class BatchWorker(QtCore.QThread):
             self._current_proc = proc
 
             last_pct = -1
+            last_progress_emit = 0.0
             duration = max(0.001, float(in_seconds))
             out_time = 0.0
             speed_x = 1.0
@@ -1443,12 +1614,20 @@ class BatchWorker(QtCore.QThread):
                     sec_left = max(0.0, (duration - out_time) / eff)
                     self._per_row_left[row] = sec_left
                     self._emit_overall_eta()
-                    if pct != last_pct:
+                    now = time.monotonic()
+                    if pct != last_pct and (
+                        last_progress_emit == 0.0
+                        or (now - last_progress_emit) >= self._progress_emit_interval
+                        or pct >= 100
+                    ):
                         self.row_progress.emit(row, pct, fmt_hms(sec_left), phase)
                         last_pct = pct
+                        last_progress_emit = now
 
             exit_code = proc.wait()
             self._current_proc = None
+            if exit_code == 0 and last_pct < 100:
+                self.row_progress.emit(row, 100, "0s", phase)
             return exit_code == 0
 
         except Exception:
@@ -1955,19 +2134,24 @@ class SettingsDialog(QtWidgets.QDialog):
 class ThumbnailWorker(QtCore.QThread):
     thumb_ready = QtCore.Signal(str, QtGui.QIcon)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, use_cuda: bool = False):
         super().__init__(parent)
-        self.queue: List[str] = []
+        self.queue = deque()
+        self._queued: set[str] = set()
         self._running = True
         self._mutex = QtCore.QMutex()
         self._cond = QtCore.QWaitCondition()
+        self._use_cuda = bool(use_cuda)
+
+    def set_use_cuda(self, enabled: bool):
+        with QtCore.QMutexLocker(self._mutex):
+            self._use_cuda = bool(enabled)
 
     def add_path(self, path: str):
-        if not HAS_OPENCV:
-            return
         with QtCore.QMutexLocker(self._mutex):
-            if path not in self.queue:
+            if path not in self._queued:
                 self.queue.append(path)
+                self._queued.add(path)
                 self._cond.wakeOne()
 
     def stop(self):
@@ -1976,47 +2160,233 @@ class ThumbnailWorker(QtCore.QThread):
             self._cond.wakeOne()
         self.wait()
 
-    def run(self):
-        if not HAS_OPENCV:
+    def _thumb_via_ffmpeg(self, path: str, use_cuda: bool) -> Optional[QtGui.QIcon]:
+        ffmpeg = which("ffmpeg")
+        if not ffmpeg:
+            return None
+        vf = "scale=240:-1:flags=fast_bilinear"
+        cmd = [ffmpeg, "-hide_banner", "-loglevel", "error"]
+        if use_cuda:
+            cmd += ["-hwaccel", "cuda"]
+        cmd += [
+            "-ss", "0.5",
+            "-i", path,
+            "-frames:v", "1",
+            "-vf", vf,
+            "-f", "image2pipe",
+            "-vcodec", "png",
+            "-",
+        ]
+        try:
+            proc = subprocess.run(
+                cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
+            )
+            if proc.returncode != 0 or not proc.stdout:
+                return None
+            img = QtGui.QImage.fromData(proc.stdout, b"PNG")
+            if img.isNull():
+                return None
+            return QtGui.QIcon(QtGui.QPixmap.fromImage(img))
+        except Exception:
+            return None
+
+    def _thumb_via_opencv(self, path: str) -> Optional[QtGui.QIcon]:
+        if not HAS_OPENCV or cv2 is None:
+            return None
+        try:
+            backend = cv2.CAP_FFMPEG if os.name == 'nt' else cv2.CAP_ANY
+            cap = cv2.VideoCapture(path, backend)
+            if not cap.isOpened():
+                cap = cv2.VideoCapture(path)
+
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 20)
+            ok, frame = cap.read()
+            cap.release()
+            if not ok or frame is None:
+                return None
+            h, w = frame.shape[:2]
+            if w <= 0 or h <= 0:
+                return None
+            target_w = 240
+            scale = target_w / float(w)
+            frame = cv2.resize(frame, (target_w, int(h * scale)))
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            img = QtGui.QImage(
+                frame.data,
+                frame.shape[1],
+                frame.shape[0],
+                frame.strides[0],
+                QtGui.QImage.Format_RGB888,
+            )
+            return QtGui.QIcon(QtGui.QPixmap.fromImage(img))
+        except Exception:
+            return None
+
+    def _load_cached_icon(self, path: str) -> Optional[QtGui.QIcon]:
+        path_str, mtime_ns, size_b = file_signature(path)
+        cached = MEDIA_CACHE.get(path_str, mtime_ns, size_b)
+        thumb_path = str(cached["thumb_path"]) if cached else ""
+        if not thumb_path:
+            return None
+        icon = QtGui.QIcon(thumb_path)
+        return None if icon.isNull() else icon
+
+    def _store_thumb_cache(self, path: str, icon: QtGui.QIcon):
+        path_str, mtime_ns, size_b = file_signature(path)
+        if mtime_ns == 0 and size_b == 0:
             return
+        pixmap = icon.pixmap(240, 135)
+        if pixmap.isNull():
+            return
+        thumb_file = cached_thumb_file(path_str, mtime_ns, size_b)
+        try:
+            thumb_file.parent.mkdir(parents=True, exist_ok=True)
+            pixmap.toImage().save(str(thumb_file), "PNG")
+            MEDIA_CACHE.upsert_thumb(path_str, mtime_ns, size_b, str(thumb_file))
+        except Exception:
+            pass
+
+    def run(self):
         while self._running:
             with QtCore.QMutexLocker(self._mutex):
                 while not self.queue and self._running:
                     self._cond.wait(self._mutex)
                 if not self._running:
                     return
-                path = self.queue.pop(0)
+                path = self.queue.popleft()
+                self._queued.discard(path)
+                use_cuda = self._use_cuda
             if not path:
                 continue
             try:
-                backend = cv2.CAP_FFMPEG if os.name == 'nt' else cv2.CAP_ANY
-                cap = cv2.VideoCapture(path, backend)
-                if not cap.isOpened():
-                    cap = cv2.VideoCapture(path)
-
-                cap.set(cv2.CAP_PROP_POS_FRAMES, 20)
-                ok, frame = cap.read()
-                cap.release()
-                if not ok or frame is None:
-                    continue
-                h, w = frame.shape[:2]
-                if w <= 0 or h <= 0:
-                    continue
-                target_w = 240
-                scale = target_w / float(w)
-                frame = cv2.resize(frame, (target_w, int(h * scale)))
-                frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                img = QtGui.QImage(
-                    frame.data,
-                    frame.shape[1],
-                    frame.shape[0],
-                    frame.strides[0],
-                    QtGui.QImage.Format_RGB888,
-                )
-                icon = QtGui.QIcon(QtGui.QPixmap.fromImage(img))
-                self.thumb_ready.emit(path, icon)
+                icon = self._load_cached_icon(path)
+                if icon is None:
+                    icon = self._thumb_via_ffmpeg(path, use_cuda)
+                if icon is None:
+                    icon = self._thumb_via_opencv(path)
+                if icon is not None:
+                    self._store_thumb_cache(path, icon)
+                    self.thumb_ready.emit(path, icon)
             except Exception:
                 pass
+
+
+class MetadataWorker(QtCore.QThread):
+    metadata_ready = QtCore.Signal(str, float, int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.queue = deque()
+        self._queued: set[str] = set()
+        self._running = True
+        self._mutex = QtCore.QMutex()
+        self._cond = QtCore.QWaitCondition()
+
+    def add_path(self, path: str):
+        with QtCore.QMutexLocker(self._mutex):
+            if path not in self._queued:
+                self.queue.append(path)
+                self._queued.add(path)
+                self._cond.wakeOne()
+
+    def stop(self):
+        self._running = False
+        with QtCore.QMutexLocker(self._mutex):
+            self._cond.wakeOne()
+        self.wait()
+
+    def _probe_duration(self, path: str) -> float:
+        if HAS_OPENCV and cv2 is not None:
+            try:
+                cap = cv2.VideoCapture(path)
+                if cap.isOpened():
+                    fps = float(cap.get(cv2.CAP_PROP_FPS) or 0.0)
+                    frames = float(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0.0)
+                    if fps > 0.0 and frames > 0.0:
+                        cap.release()
+                        return max(0.0, frames / fps)
+                cap.release()
+            except Exception:
+                pass
+        try:
+            out = subprocess.check_output(
+                [
+                    (which("ffprobe") or "ffprobe"),
+                    "-v", "error",
+                    "-show_entries", "format=duration",
+                    "-of", "default=noprint_wrappers=1:nokey=1",
+                    path,
+                ],
+                text=True,
+                timeout=6,
+            )
+            return float(out.strip() or 0.0)
+        except Exception:
+            return 0.0
+
+    def run(self):
+        while self._running:
+            with QtCore.QMutexLocker(self._mutex):
+                while not self.queue and self._running:
+                    self._cond.wait(self._mutex)
+                if not self._running:
+                    return
+                path = self.queue.popleft()
+                self._queued.discard(path)
+            if not path:
+                continue
+            path_str, mtime_ns, size_b = file_signature(path)
+            cached = MEDIA_CACHE.get(path_str, mtime_ns, size_b)
+            if cached is not None:
+                self.metadata_ready.emit(path_str, float(cached["duration_s"]), int(cached["size_b"]))
+                continue
+            duration = self._probe_duration(path_str)
+            MEDIA_CACHE.upsert_metadata(path_str, mtime_ns, size_b, duration)
+            self.metadata_ready.emit(path_str, duration, size_b)
+
+
+class FolderScanWorker(QtCore.QThread):
+    progress = QtCore.Signal(int, str)
+    scan_finished = QtCore.Signal(str, list)
+
+    def __init__(self, base: Path, parent=None):
+        super().__init__(parent)
+        self.base = Path(base)
+
+    def run(self):
+        found: List[Path] = []
+        tick = 0
+        for path in fast_scan_videos(self.base):
+            found.append(path)
+            tick += 1
+            if tick % 100 == 0:
+                self.progress.emit(len(found), f"Map scannen... ({len(found)} gevonden)")
+        found.sort(key=lambda p: (p.parent.as_posix().lower(), p.name.lower()))
+        self.scan_finished.emit(str(self.base), found)
+
+
+class IntroDetectWorker(QtCore.QThread):
+    progress = QtCore.Signal(int, int, int, float)
+    finished_scan = QtCore.Signal(int, int)
+
+    def __init__(self, ffmpeg: str, rows_and_paths: List[tuple[int, str]], parent=None):
+        super().__init__(parent)
+        self.ffmpeg = ffmpeg
+        self.rows_and_paths = list(rows_and_paths)
+
+    def run(self):
+        count = 0
+        total = len(self.rows_and_paths)
+        for index, (row, path) in enumerate(self.rows_and_paths, 1):
+            found_sec = detect_intro_ffmpeg(self.ffmpeg, path)
+            if found_sec > 0:
+                count += 1
+            self.progress.emit(index, total, row, found_sec)
+        self.finished_scan.emit(count, total)
 
 
 class ThumbnailList(QtWidgets.QListWidget):
@@ -2104,6 +2474,12 @@ class ThumbnailList(QtWidgets.QListWidget):
             super().dropEvent(e)
         else:
             super().dropEvent(e)
+
+    def resizeEvent(self, event: QtGui.QResizeEvent):
+        super().resizeEvent(event)
+        host = self.window()
+        if host and hasattr(host, "_queue_visible_thumbnails"):
+            host._queue_visible_thumbnails()
 
 
 class ThumbnailPickerDialog(QtWidgets.QDialog):
@@ -2310,6 +2686,12 @@ class Main(QtWidgets.QWidget):
         self._theme_name = self.settings.value("ui/theme", DEFAULT_THEME)
         if self._theme_name not in THEMES:
             self._theme_name = DEFAULT_THEME
+        self._meta_cache: Dict[tuple[str, int, int], tuple[float, int]] = {}
+        self._thumb_icon_cache: Dict[str, QtGui.QIcon] = {}
+        self._row_by_path: Dict[str, int] = {}
+        self._thumb_queue_rr = 0
+        self._folder_scan_worker: Optional[FolderScanWorker] = None
+        self._intro_worker: Optional[IntroDetectWorker] = None
 
         # --- Top Bar ---
         self.btn_add = QtWidgets.QPushButton("➕ Bestand")
@@ -2589,6 +2971,8 @@ class Main(QtWidgets.QWidget):
         self.table.files_dropped.connect(self.add_files)
         self.thumbs.files_dropped.connect(self.add_files)
         self.thumbs.order_changed.connect(self.sync_table_to_thumbs_order)
+        self.thumbs.verticalScrollBar().valueChanged.connect(self._queue_visible_thumbnails)
+        self.thumbs.horizontalScrollBar().valueChanged.connect(self._queue_visible_thumbnails)
 
         # --- SYNC: Klik op thumb -> Selecteer rij ---
         self.thumbs.itemClicked.connect(self._thumb_clicked)
@@ -2600,6 +2984,7 @@ class Main(QtWidgets.QWidget):
         self.thumbs.customContextMenuRequested.connect(self.on_thumbs_context_menu)
         self.cmb_aspect.currentTextChanged.connect(self.on_aspect_changed)
         self.ed_filter.textChanged.connect(self.apply_filter)
+        self.chk_cuda.toggled.connect(lambda _checked: self._sync_thumbnail_worker_mode())
 
         self.table.itemClicked.connect(self._table_click_play)
         self.table.itemDoubleClicked.connect(self._table_dbl_click_toggle)
@@ -2648,11 +3033,18 @@ class Main(QtWidgets.QWidget):
         self._did_splitter_fit = False
         self.worker: Optional[BatchWorker] = None
 
-        self.thumb_worker: Optional[ThumbnailWorker] = None
+        self.thumb_workers: List[ThumbnailWorker] = []
         if HAS_OPENCV:
-            self.thumb_worker = ThumbnailWorker(self)
-            self.thumb_worker.thumb_ready.connect(self.on_thumb_ready)
-            self.thumb_worker.start()
+            worker_count = max(2, min(4, int(os.cpu_count() or 2)))
+            for _ in range(worker_count):
+                tw = ThumbnailWorker(self, use_cuda=bool(self.chk_cuda.isChecked()))
+                tw.thumb_ready.connect(self.on_thumb_ready)
+                tw.start()
+                self.thumb_workers.append(tw)
+
+        self.meta_worker: Optional[MetadataWorker] = MetadataWorker(self)
+        self.meta_worker.metadata_ready.connect(self.on_metadata_ready)
+        self.meta_worker.start()
 
         # Restore previous session
         self._restore_queue()
@@ -2690,6 +3082,8 @@ class Main(QtWidgets.QWidget):
         # 1. Tabel leegmaken
         self.table.setRowCount(0)
         self.thumbs.clear()
+        self._thumb_icon_cache.clear()
+        self._row_by_path.clear()
 
         # 2. Rebuild
         paths_to_load = []
@@ -3307,11 +3701,84 @@ class Main(QtWidgets.QWidget):
         except Exception:
             pass
 
+    def _file_cache_key(self, p: Path) -> tuple[str, int, int]:
+        try:
+            st = p.stat()
+            return (str(p), int(st.st_mtime_ns), int(st.st_size))
+        except Exception:
+            return (str(p), 0, 0)
+
+    def _sync_thumbnail_worker_mode(self):
+        use_cuda = bool(getattr(self, "chk_cuda", None) and self.chk_cuda.isChecked())
+        for worker in getattr(self, "thumb_workers", []):
+            worker.set_use_cuda(use_cuda)
+
+    def _queue_visible_thumbnails(self):
+        if not self.thumb_workers:
+            return
+        viewport = self.thumbs.viewport()
+        if viewport is None:
+            return
+        visible_rect = viewport.rect().adjusted(-200, -140, 200, 140)
+        for i in range(self.thumbs.count()):
+            it = self.thumbs.item(i)
+            if not it:
+                continue
+            path = str(it.data(QtCore.Qt.UserRole) or "")
+            if not path or path in self.custom_thumbs or path in self._thumb_icon_cache:
+                continue
+            rect = self.thumbs.visualItemRect(it)
+            if rect.isValid() and rect.intersects(visible_rect):
+                self._queue_thumbnail_path(path)
+
+    def _queue_thumbnail_path(self, path: str):
+        if not self.thumb_workers:
+            return
+        idx = self._thumb_queue_rr % len(self.thumb_workers)
+        self._thumb_queue_rr += 1
+        self.thumb_workers[idx].add_path(path)
+
+    def _queue_metadata(self, p: Path):
+        key = self._file_cache_key(p)
+        cached = self._meta_cache.get(key)
+        if cached is not None:
+            self.on_metadata_ready(str(p), cached[0], cached[1])
+            return
+        path_str, mtime_ns, size_b = key
+        db_cached = MEDIA_CACHE.get(path_str, mtime_ns, size_b)
+        if db_cached is not None:
+            self.on_metadata_ready(path_str, float(db_cached["duration_s"]), int(db_cached["size_b"]))
+            return
+        if self.meta_worker:
+            self.meta_worker.add_path(str(p))
+
+    def _cached_thumb_icon_for(self, p: Path) -> Optional[QtGui.QIcon]:
+        path_str, mtime_ns, size_b = self._file_cache_key(p)
+        db_cached = MEDIA_CACHE.get(path_str, mtime_ns, size_b)
+        thumb_path = str(db_cached["thumb_path"]) if db_cached else ""
+        if not thumb_path:
+            return None
+        icon = QtGui.QIcon(thumb_path)
+        return None if icon.isNull() else icon
+
+    def on_metadata_ready(self, path: str, duration: float, size_b: int):
+        key = self._file_cache_key(Path(path))
+        self._meta_cache[key] = (float(duration), int(size_b))
+        row = self._row_by_path.get(path)
+        if row is None or row < 0 or row >= self.table.rowCount():
+            return
+        it_file = self.table.item(row, COL_FILE)
+        if not it_file or it_file.toolTip() != path:
+            return
+        self.table.setItem(row, COL_DUR, QtWidgets.QTableWidgetItem(fmt_hms(duration)))
+        self.table.setItem(row, COL_SIZE, NumericItem(fmt_size(size_b)))
+
     def showEvent(self, event: QtGui.QShowEvent) -> None:
         super().showEvent(event)
         if not getattr(self, "_did_splitter_fit", False):
             self._did_splitter_fit = True
             QtCore.QTimer.singleShot(80, self._fit_splitter_to_columns)
+        QtCore.QTimer.singleShot(0, self._queue_visible_thumbnails)
 
     def on_aspect_changed(self, txt: str):
         self.settings.setValue("video/aspect", txt)
@@ -3353,7 +3820,7 @@ class Main(QtWidgets.QWidget):
         }
 
         for i, p in enumerate(paths, 1):
-            if do_overlay:
+            if do_overlay and (i == 1 or i % 20 == 0 or i == total):
                 self.overlay.set_message(
                     f"Inladen: {i} / {total} • {p.name}"
                 )
@@ -3369,6 +3836,7 @@ class Main(QtWidgets.QWidget):
             sp = str(p)
             if sp in existing:
                 continue
+            existing.add(sp)
 
             r = self.table.rowCount()
             self.table.insertRow(r)
@@ -3390,40 +3858,15 @@ class Main(QtWidgets.QWidget):
             it_file = QtWidgets.QTableWidgetItem(p.name)
             it_file.setToolTip(sp)
             self.table.setItem(r, COL_FILE, it_file)
+            self._row_by_path[sp] = r
             self.table.setItem(
                 r,
                 COL_TYPE,
                 QtWidgets.QTableWidgetItem(p.suffix.upper().lstrip(".")),
             )
-
-            dsec = 0.0
-            try:
-                out = subprocess.check_output(
-                    [
-                        (which("ffprobe") or "ffprobe"),
-                        "-v",
-                        "error",
-                        "-show_entries",
-                        "format=duration",
-                        "-of",
-                        "default=noprint_wrappers=1:nokey=1",
-                        sp,
-                    ],
-                    text=True,
-                    timeout=6,
-                )
-                dsec = float(out.strip() or 0)
-            except Exception:
-                dsec = 0.0
-
-            self.table.setItem(r, COL_DUR, QtWidgets.QTableWidgetItem(fmt_hms(dsec)))
-
-            try:
-                size_b = p.stat().st_size
-            except Exception:
-                size_b = 0
-
-            self.table.setItem(r, COL_SIZE, NumericItem(fmt_size(size_b)))
+            self.table.setItem(r, COL_DUR, QtWidgets.QTableWidgetItem("..."))
+            self.table.setItem(r, COL_SIZE, NumericItem("..."))
+            self._queue_metadata(p)
 
             self.table.setItem(r, COL_PCT, QtWidgets.QTableWidgetItem("0%"))
             self.table.setItem(r, COL_REMAIN, QtWidgets.QTableWidgetItem("—"))
@@ -3432,32 +3875,33 @@ class Main(QtWidgets.QWidget):
             th = QListWidgetItem(p.name)
             th.setToolTip(sp)
             th.setData(QtCore.Qt.UserRole, sp)
-            th.setIcon(self.style().standardIcon(QStyle.SP_FileIcon))
+            cached_icon = self._thumb_icon_cache.get(sp) or self._cached_thumb_icon_for(p)
+            if cached_icon is not None:
+                self._thumb_icon_cache[sp] = cached_icon
+            th.setIcon(cached_icon or self.style().standardIcon(QStyle.SP_FileIcon))
             self.thumbs.addItem(th)
             has_custom_thumb = self._apply_custom_thumb_if_exists(sp)
-            if self.thumb_worker and not has_custom_thumb:
-                self.thumb_worker.add_path(sp)
+            if not has_custom_thumb:
+                self._queue_visible_thumbnails()
 
         if do_overlay:
             self.overlay.stop()
 
         self._ensure_row_checkboxes()
         self.table.setSortingEnabled(True)
+        self._queue_visible_thumbnails()
         self._save_queue()
 
     def _scan_folder_with_overlay(self, base: Path) -> List[Path]:
         self.overlay.start_busy("Map scannen...")
         QtWidgets.QApplication.processEvents()
         found: List[Path] = []
-        exts = VIDEO_EXTS
         tick = 0
         try:
-            for dirpath, _dirs, files in os.walk(base):
-                for fn in files:
-                    if Path(fn).suffix.lower() in exts:
-                        found.append(Path(dirpath) / fn)
+            for path in fast_scan_videos(base):
+                found.append(path)
                 tick += 1
-                if tick % 25 == 0:
+                if tick % 100 == 0:
                     self.overlay.set_message(
                         f"Map scannen... ({len(found)} gevonden)"
                     )
@@ -3471,7 +3915,24 @@ class Main(QtWidgets.QWidget):
         )
         return found
 
+    def _on_folder_scan_progress(self, _count: int, message: str):
+        self.overlay.set_message(message)
+        QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 30)
+
+    def _on_folder_scan_finished(self, base_str: str, paths: list):
+        self.overlay.stop()
+        self._folder_scan_worker = None
+        base = Path(base_str)
+        if paths:
+            self.add_files([Path(p) for p in paths])
+        try:
+            self.last_dir = str(base)
+            self.settings.setValue("ui/last_dir", self.last_dir)
+        except Exception:
+            pass
+
     def on_thumb_ready(self, path: str, icon: QtGui.QIcon):
+        self._thumb_icon_cache[path] = icon
         if self._apply_custom_thumb_if_exists(path):
             return
         for i in range(self.thumbs.count()):
@@ -3504,14 +3965,13 @@ class Main(QtWidgets.QWidget):
         if not d:
             return
         base = Path(d)
-        paths = self._scan_folder_with_overlay(base)
-        if paths:
-            self.add_files(paths)
-        try:
-            self.last_dir = str(base)
-            self.settings.setValue("ui/last_dir", self.last_dir)
-        except Exception:
-            pass
+        if self._folder_scan_worker and self._folder_scan_worker.isRunning():
+            return
+        self.overlay.start_busy("Map scannen...")
+        self._folder_scan_worker = FolderScanWorker(base, self)
+        self._folder_scan_worker.progress.connect(self._on_folder_scan_progress)
+        self._folder_scan_worker.scan_finished.connect(self._on_folder_scan_finished)
+        self._folder_scan_worker.start()
 
     def on_refresh_list(self):
         prev_state: Dict[str, Dict[str, Any]] = {}
@@ -3535,6 +3995,8 @@ class Main(QtWidgets.QWidget):
 
         self.table.setRowCount(0)
         self.thumbs.clear()
+        self._thumb_icon_cache.clear()
+        self._row_by_path.clear()
         if paths:
             self._add_files_internal(paths, use_overlay=True)
             for r in range(self.table.rowCount()):
@@ -3571,12 +4033,21 @@ class Main(QtWidgets.QWidget):
                 it = self.thumbs.item(i)
                 if it.data(QtCore.Qt.UserRole) in paths_to_remove:
                     self.thumbs.takeItem(i)
+            for path in paths_to_remove:
+                self._thumb_icon_cache.pop(path, None)
+                self._row_by_path.pop(path, None)
+        for row in range(self.table.rowCount()):
+            it_file = self.table.item(row, COL_FILE)
+            if it_file and it_file.toolTip():
+                self._row_by_path[it_file.toolTip()] = row
         self._save_queue()
 
     def on_clear(self):
         self.save_undo_snapshot()  # Save before clear
         self.table.setRowCount(0)
         self.thumbs.clear()
+        self._thumb_icon_cache.clear()
+        self._row_by_path.clear()
         self._save_queue()
 
     def on_apply(self):
@@ -3908,33 +4379,49 @@ class Main(QtWidgets.QWidget):
 
     # ---------------- Intro Detection ----------------
     def on_detect_intro(self):
+        if self._intro_worker and self._intro_worker.isRunning():
+            return
         rows = sorted({i.row() for i in self.table.selectedIndexes()})
         if not rows:
             QtWidgets.QMessageBox.information(self, "Intro", "Selecteer eerst regels om te scannen.")
             return
 
         ffmpeg = which("ffmpeg") or "ffmpeg"
+        rows_and_paths: List[tuple[int, str]] = []
+        for r in rows:
+            it = self.table.item(r, COL_FILE)
+            if not it or not it.toolTip():
+                continue
+            rows_and_paths.append((r, it.toolTip()))
+            self.table.setItem(r, COL_STATUS, QtWidgets.QTableWidgetItem("Intro scannen..."))
+
+        if not rows_and_paths:
+            QtWidgets.QMessageBox.information(self, "Intro", "Geen geldige bestanden geselecteerd.")
+            return
 
         self.btn_detect.setEnabled(False)
         self.btn_detect.setText("Scannen...")
-        QtWidgets.QApplication.processEvents()
-
         self.table.setSortingEnabled(False)
+        self._intro_worker = IntroDetectWorker(ffmpeg, rows_and_paths, self)
+        self._intro_worker.progress.connect(self._on_intro_detect_progress)
+        self._intro_worker.finished_scan.connect(self._on_intro_detect_finished)
+        self._intro_worker.start()
 
-        count = 0
-        for r in rows:
-            path = self.table.item(r, COL_FILE).toolTip()
-            found_sec = detect_intro_ffmpeg(ffmpeg, path)
-            if found_sec > 0:
-                self.table.setItem(r, COL_SEC, NumericItem(str(int(found_sec))))
-                self.table.setItem(r, COL_MMSS, QtWidgets.QTableWidgetItem(seconds_to_mmss(found_sec)))
-                self.table.setItem(r, COL_STATUS, QtWidgets.QTableWidgetItem(f"Intro: {int(found_sec)}s"))
-                count += 1
+    def _on_intro_detect_progress(self, index: int, total: int, row: int, found_sec: float):
+        self.btn_detect.setText(f"Scannen... {index}/{total}")
+        if found_sec > 0:
+            self.table.setItem(row, COL_SEC, NumericItem(str(int(found_sec))))
+            self.table.setItem(row, COL_MMSS, QtWidgets.QTableWidgetItem(seconds_to_mmss(found_sec)))
+            self.table.setItem(row, COL_STATUS, QtWidgets.QTableWidgetItem(f"Intro: {int(found_sec)}s"))
+        else:
+            self.table.setItem(row, COL_STATUS, QtWidgets.QTableWidgetItem("Geen intro gevonden"))
 
+    def _on_intro_detect_finished(self, count: int, total: int):
         self.table.setSortingEnabled(True)
         self.btn_detect.setText("Intro")
         self.btn_detect.setEnabled(True)
-        QtWidgets.QMessageBox.information(self, "Intro Scan", f"Klaar. {count} intro's gevonden en ingesteld.")
+        self._intro_worker = None
+        QtWidgets.QMessageBox.information(self, "Intro Scan", f"Klaar. {count} intro's gevonden en ingesteld van {total} scan(s).")
 
     def on_change_thumbnail(self):
         self._open_thumbnail_editor(single_path=None)
@@ -3970,6 +4457,52 @@ class Main(QtWidgets.QWidget):
         dlg.raise_()
         dlg.activateWindow()
 
+    def _get_cached_media_info_for_start(self, src: Path, row: int) -> tuple[float, int]:
+        """
+        Geef (duration_s, size_b) terug zonder synchrone ffprobe-call in on_start().
+        Volgorde:
+        1. in-memory _meta_cache
+        2. sqlite MEDIA_CACHE
+        3. tabelwaarden / bestandsgrootte
+        4. async metadata queue + veilige fallback
+        """
+        key = self._file_cache_key(src)
+        path_str, mtime_ns, size_b = key
+
+        cached = self._meta_cache.get(key)
+        if cached is not None:
+            duration_s = float(cached[0] or 0.0)
+            cached_size = int(cached[1] or size_b or 0)
+            if duration_s > 0.0:
+                return duration_s, cached_size
+
+        db_cached = MEDIA_CACHE.get(path_str, mtime_ns, size_b)
+        if db_cached is not None:
+            duration_s = float(db_cached.get("duration_s", 0.0) or 0.0)
+            cached_size = int(db_cached.get("size_b", size_b) or size_b or 0)
+            if duration_s > 0.0:
+                self._meta_cache[key] = (duration_s, cached_size)
+                return duration_s, cached_size
+
+        duration_s = 0.0
+        it_dur = self.table.item(row, COL_DUR)
+        if it_dur:
+            txt = (it_dur.text() or "").strip()
+            if txt and txt not in ("—", "..."):
+                duration_s = parse_hhmmss_to_seconds(txt)
+
+        try:
+            stat_size = int(src.stat().st_size)
+        except Exception:
+            stat_size = int(size_b or 0)
+
+        if duration_s <= 0.0:
+            self._queue_metadata(src)
+            duration_s = 60.0
+
+        self._meta_cache[key] = (float(duration_s), int(stat_size))
+        return float(duration_s), int(stat_size)
+
     # ---------------- queue starten & worker koppelen ----------------
     def on_start(self):
         if self.worker and self.worker.isRunning():
@@ -3998,29 +4531,7 @@ class Main(QtWidgets.QWidget):
                 secs = int(str(s_item.text()).split()[0])
             except Exception:
                 secs = int(self.spin_secs.value())
-            in_seconds = 60.0
-            try:
-                outp = subprocess.check_output(
-                    [
-                        (which("ffprobe") or "ffprobe"),
-                        "-v",
-                        "error",
-                        "-show_entries",
-                        "format=duration",
-                        "-of",
-                        "default=noprint_wrappers=1:nokey=1",
-                        str(src),
-                    ],
-                    text=True,
-                    timeout=6,
-                )
-                in_seconds = float(outp.strip() or 60.0)
-            except Exception:
-                in_seconds = 60.0
-            try:
-                in_bytes = src.stat().st_size
-            except Exception:
-                in_bytes = 0
+            in_seconds, in_bytes = self._get_cached_media_info_for_start(src, r)
             self.table.setItem(
                 r, COL_STATUS, QtWidgets.QTableWidgetItem("Wachtrij")
             )
@@ -4178,6 +4689,7 @@ class Main(QtWidgets.QWidget):
 
             self.a_del_src.setChecked(bool(int(self.settings.value("prefs/delete_source", 0))))
             self.a_auto_clear.setChecked(bool(int(self.settings.value("prefs/auto_clear_list", 0))))
+            self._sync_thumbnail_worker_mode()
 
     def on_about(self):
         dlg = AboutDialog(self)
@@ -4555,8 +5067,17 @@ class Main(QtWidgets.QWidget):
 
     # ---------------- close ----------------
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:
-        if self.thumb_worker and self.thumb_worker.isRunning():
-            self.thumb_worker.stop()
+        for worker in getattr(self, "thumb_workers", []):
+            if worker and worker.isRunning():
+                worker.stop()
+        if self.meta_worker and self.meta_worker.isRunning():
+            self.meta_worker.stop()
+        if self._folder_scan_worker and self._folder_scan_worker.isRunning():
+            self._folder_scan_worker.quit()
+            self._folder_scan_worker.wait()
+        if self._intro_worker and self._intro_worker.isRunning():
+            self._intro_worker.wait()
+        MEDIA_CACHE.flush_pending()
         if self.worker and self.worker.isRunning():
             self.worker.request_stop_all()
             self.worker.wait()
