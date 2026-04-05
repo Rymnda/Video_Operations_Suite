@@ -24,19 +24,19 @@ Video Operations Suite is a desktop batch video tool for trimming, remuxing, tra
 
 ## Install
 ```bash
-C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe -m pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ## Run From Source
 ```bash
-C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe Video_Operations_Suite_v1.py
+python Video_Operations_Suite_v1.py
 ```
 
 ## Build
 
 Portable executable:
 ```bash
-C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe -m PyInstaller --noconfirm --clean Video_Operations_Suite.spec
+python -m PyInstaller --noconfirm --clean Video_Operations_Suite.spec
 ```
 
 Installer:
@@ -56,7 +56,7 @@ Build files:
 
 ## Notes
 - The app uses `assets/Video_Operations_Suite_.ico` as the application icon.
-- Development/runtime interpreter used here: `C:\Users\ansem\Documents\Github\_venvs\venv_cuda_py310_np1\Scripts\python.exe` (`Python 3.10.11`).
+- Recommended setup: use a local virtual environment with Python 3.10.
 - `VOS_PYTHONPATH` can be set to prepend extra Python paths without hardcoding them in the script.
 - Build output is intentionally excluded from git.
 
